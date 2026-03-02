@@ -338,13 +338,57 @@ This tells you exactly which container role made the call and that it originated
 
 ---
 
+## ECS as a More Secure Alternative
+
+The IMDS + config profile approach used in this project eliminates static keys and provides per-container role scoping through configuration. However, a credential isolation gap remains that ECS task roles would close.
+
+### The Credential Isolation Gap
+
+In the current setup, each container gets a **different role by configuration**, but any process on the EC2 instance that can reach IMDS (`169.254.169.254`) can assume **any** of the three container roles. The instance base role has `sts:AssumeRole` permission on all three. A compromised Container A could call `sts:AssumeRole` for Container C's KMS role — nothing in the infrastructure prevents it. The isolation is enforced by config files, not by the credential provider.
+
+### What ECS Task Roles Fix
+
+ECS provides a **per-task credential endpoint** (`169.254.170.2`) that is unique to each container. The ECS agent injects an `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` environment variable into each task pointing to a task-specific path. Container A literally cannot request Container B's credentials because it doesn't know (and can't discover) Container B's credential path. The credential vending is enforced at the infrastructure level, not by convention.
+
+```
+Current (EC2 + IMDS):
+  All containers → shared IMDS → shared base role → any of 3 roles
+
+ECS Task Roles:
+  Container A → task endpoint /v2/credentials/UUID-A → role-a only
+  Container B → task endpoint /v2/credentials/UUID-B → role-b only
+  Container C → task endpoint /v2/credentials/UUID-C → role-c only
+```
+
+### ECS Fargate vs. ECS on EC2 vs. Current Setup
+
+| Factor | EC2 + Podman (current) | ECS on EC2 | ECS Fargate |
+|---|---|---|---|
+| Per-container credential isolation | Config-level only | Infrastructure-enforced | Infrastructure-enforced |
+| IMDS credential leakage risk | Any container can assume any role | Can disable IMDS per task | No IMDS (no EC2 to access) |
+| Host OS patching | You manage it | You manage it | AWS manages it |
+| Container escape blast radius | Full EC2 access | Full EC2 access | No host to escape to |
+| Cost (3 small containers) | ~$7.60/mo (t3.micro) | ~$7.60/mo + ECS overhead | ~$30-40/mo |
+| Operational complexity | Low (Podman + scripts) | Medium (ECS cluster, task defs, service config) | Medium (task defs, service config, VPC networking) |
+| Migration effort from current setup | N/A | Significant | Significant |
+
+### Recommendation
+
+**Fargate is the most secure option** — it eliminates the shared host entirely, so there's no IMDS to leak, no host OS to escape to, and credentials are truly isolated per task. **ECS on EC2** still gives infrastructure-enforced task roles but retains the EC2 attack surface.
+
+Whether the migration is worth it depends on context. The current IMDS approach eliminates the biggest real-world risk (static long-lived keys) and is appropriate for many workloads. ECS task roles close the remaining theoretical gap (cross-container role assumption on a shared host), but at the cost of higher operational complexity and (for Fargate) roughly 4-5x the monthly spend for a workload this size.
+
+For a production environment handling sensitive data, Fargate is the right call. For a demo or workload where the containers are trusted code you control, the IMDS approach is a pragmatic and significant security improvement over static keys.
+
+---
+
 ## FAQ
 
 **Q: Why not use ECS task roles instead?**
-A: This workload runs on a standalone EC2 instance with Podman, not on ECS. ECS task roles rely on the ECS agent to vend credentials via a container-local metadata endpoint. That infrastructure does not exist here. The IMDS + config profile approach achieves the same per-container isolation without requiring ECS.
+A: This workload runs on a standalone EC2 instance with Podman, not on ECS. ECS task roles rely on the ECS agent to vend credentials via a container-local metadata endpoint. That infrastructure does not exist here. The IMDS + config profile approach achieves the same per-container isolation without requiring ECS. See the [ECS as a More Secure Alternative](#ecs-as-a-more-secure-alternative) section above for a detailed comparison.
 
 **Q: Could one container assume another container's role?**
-A: In theory, yes — any process on the instance that can reach IMDS could assume any of the three container roles, because the trust policy is on the instance base role (not on a specific container). True container-level isolation of credentials would require a credential vending service or ECS-style task roles. However, this approach eliminates the far larger risk of static keys while maintaining per-container scoping through configuration.
+A: In theory, yes — any process on the instance that can reach IMDS could assume any of the three container roles, because the trust policy is on the instance base role (not on a specific container). True container-level isolation of credentials would require a credential vending service or ECS-style task roles. However, this approach eliminates the far larger risk of static keys while maintaining per-container scoping through configuration. See the [Credential Isolation Gap](#the-credential-isolation-gap) section for more detail.
 
 **Q: What happens if IMDS goes down?**
 A: The SDK would fail to refresh credentials once the current cached credentials expire (within 1 hour for assumed role creds). AWS API calls would start failing with `ExpiredTokenException`. IMDS outages are extremely rare as it is a core EC2 infrastructure service.
