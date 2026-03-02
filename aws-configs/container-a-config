@@ -1,0 +1,4 @@
+[profile container-role]
+role_arn = CONTAINER_A_ROLE_ARN_PLACEHOLDER
+credential_source = Ec2InstanceMetadata
+region = us-east-1

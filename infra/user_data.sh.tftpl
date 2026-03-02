@@ -1,0 +1,422 @@
+#!/bin/bash
+set -euo pipefail
+exec > /var/log/user-data.log 2>&1
+echo "=== User data script started at $(date) ==="
+
+# Variables from Terraform
+REGION="${region}"
+S3_BUCKET="${s3_bucket}"
+DYNAMODB_TABLE="${dynamodb_table}"
+KMS_KEY_ID="${kms_key_id}"
+
+# Phase 1: Legacy static access keys
+S3_ACCESS_KEY="${s3_access_key}"
+S3_SECRET_KEY="${s3_secret_key}"
+DDB_ACCESS_KEY="${ddb_access_key}"
+DDB_SECRET_KEY="${ddb_secret_key}"
+KMS_ACCESS_KEY="${kms_access_key}"
+KMS_SECRET_KEY="${kms_secret_key}"
+
+# Phase 2: Role ARNs (pre-staged for migration)
+CONTAINER_A_ROLE_ARN="${container_a_role_arn}"
+CONTAINER_B_ROLE_ARN="${container_b_role_arn}"
+CONTAINER_C_ROLE_ARN="${container_c_role_arn}"
+
+# Install dependencies (Fedora 41 — Podman and passt are in default repos)
+echo "=== Installing dependencies ==="
+dnf install -y podman passt python3-pip curl
+
+# Verify podman and pasta networking
+echo "=== Verifying Podman and pasta ==="
+podman --version
+rpm -q passt
+podman info | grep -i -A2 network || true
+
+# Create appuser for rootless containers
+echo "=== Creating appuser ==="
+useradd -m -s /bin/bash appuser || echo "appuser already exists"
+loginctl enable-linger appuser
+
+# Create container directories
+echo "=== Setting up container build directories ==="
+APPUSER_HOME=/home/appuser
+
+# --- Container A: S3 workload ---
+mkdir -p $APPUSER_HOME/containers/container-a
+cat > $APPUSER_HOME/containers/container-a/Dockerfile << 'DOCKERFILE'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir boto3
+RUN useradd -m app
+USER app
+WORKDIR /home/app
+COPY app.py .
+CMD ["python", "-u", "app.py"]
+DOCKERFILE
+
+cat > $APPUSER_HOME/containers/container-a/app.py << 'PYEOF'
+import boto3
+import os
+import time
+import json
+from datetime import datetime
+
+BUCKET = os.environ["S3_BUCKET"]
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+def main():
+    s3 = boto3.client("s3", region_name=REGION)
+    iteration = 0
+
+    while True:
+        iteration += 1
+        timestamp = datetime.utcnow().isoformat()
+        key = f"test-object-{iteration}.json"
+        body = json.dumps({"iteration": iteration, "timestamp": timestamp})
+
+        try:
+            # Put object
+            s3.put_object(Bucket=BUCKET, Key=key, Body=body)
+            print(f"[{timestamp}] PUT s3://{BUCKET}/{key} - SUCCESS")
+
+            # Get object
+            response = s3.get_object(Bucket=BUCKET, Key=key)
+            data = response["Body"].read().decode("utf-8")
+            print(f"[{timestamp}] GET s3://{BUCKET}/{key} - SUCCESS: {data}")
+
+        except Exception as e:
+            print(f"[{timestamp}] ERROR: {e}")
+
+        time.sleep(30)
+
+if __name__ == "__main__":
+    print("Container A (S3 workload) starting...")
+    main()
+PYEOF
+
+# --- Container B: DynamoDB workload ---
+mkdir -p $APPUSER_HOME/containers/container-b
+cat > $APPUSER_HOME/containers/container-b/Dockerfile << 'DOCKERFILE'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir boto3
+RUN useradd -m app
+USER app
+WORKDIR /home/app
+COPY app.py .
+CMD ["python", "-u", "app.py"]
+DOCKERFILE
+
+cat > $APPUSER_HOME/containers/container-b/app.py << 'PYEOF'
+import boto3
+import os
+import time
+import uuid
+from datetime import datetime
+
+TABLE = os.environ["DYNAMODB_TABLE"]
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+def main():
+    dynamodb = boto3.client("dynamodb", region_name=REGION)
+    iteration = 0
+
+    while True:
+        iteration += 1
+        timestamp = datetime.utcnow().isoformat()
+        item_id = str(uuid.uuid4())[:8]
+
+        try:
+            # PutItem
+            dynamodb.put_item(
+                TableName=TABLE,
+                Item={
+                    "pk": {"S": f"test-{item_id}"},
+                    "sk": {"S": timestamp},
+                    "iteration": {"N": str(iteration)},
+                    "message": {"S": f"Hello from container B, iteration {iteration}"}
+                }
+            )
+            print(f"[{timestamp}] PutItem pk=test-{item_id} - SUCCESS")
+
+            # GetItem
+            response = dynamodb.get_item(
+                TableName=TABLE,
+                Key={
+                    "pk": {"S": f"test-{item_id}"},
+                    "sk": {"S": timestamp}
+                }
+            )
+            item = response.get("Item", {})
+            print(f"[{timestamp}] GetItem pk=test-{item_id} - SUCCESS: {item.get('message', {}).get('S', 'N/A')}")
+
+        except Exception as e:
+            print(f"[{timestamp}] ERROR: {e}")
+
+        time.sleep(30)
+
+if __name__ == "__main__":
+    print("Container B (DynamoDB workload) starting...")
+    main()
+PYEOF
+
+# --- Container C: KMS workload ---
+mkdir -p $APPUSER_HOME/containers/container-c
+cat > $APPUSER_HOME/containers/container-c/Dockerfile << 'DOCKERFILE'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir boto3
+RUN useradd -m app
+USER app
+WORKDIR /home/app
+COPY app.py .
+CMD ["python", "-u", "app.py"]
+DOCKERFILE
+
+cat > $APPUSER_HOME/containers/container-c/app.py << 'PYEOF'
+import boto3
+import os
+import time
+import base64
+from datetime import datetime
+
+KMS_KEY_ID = os.environ["KMS_KEY_ID"]
+REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+def main():
+    kms = boto3.client("kms", region_name=REGION)
+    iteration = 0
+
+    while True:
+        iteration += 1
+        timestamp = datetime.utcnow().isoformat()
+        plaintext = f"Secret message #{iteration} at {timestamp}"
+
+        try:
+            # Encrypt
+            encrypt_response = kms.encrypt(
+                KeyId=KMS_KEY_ID,
+                Plaintext=plaintext.encode("utf-8")
+            )
+            ciphertext = encrypt_response["CiphertextBlob"]
+            print(f"[{timestamp}] Encrypt - SUCCESS (ciphertext length: {len(ciphertext)} bytes)")
+
+            # Decrypt
+            decrypt_response = kms.decrypt(
+                CiphertextBlob=ciphertext
+            )
+            decrypted = decrypt_response["Plaintext"].decode("utf-8")
+            print(f"[{timestamp}] Decrypt - SUCCESS: {decrypted}")
+
+        except Exception as e:
+            print(f"[{timestamp}] ERROR: {e}")
+
+        time.sleep(30)
+
+if __name__ == "__main__":
+    print("Container C (KMS workload) starting...")
+    main()
+PYEOF
+
+# --- Phase 1: Legacy deploy script (static access keys) ---
+mkdir -p $APPUSER_HOME/scripts
+cat > $APPUSER_HOME/scripts/deploy-legacy.sh << DEPLOYEOF
+#!/bin/bash
+set -euo pipefail
+echo "=== Legacy Deployment (Static Access Keys) ==="
+
+APPUSER_HOME=/home/appuser
+
+# Stop and remove existing containers
+echo "Stopping existing containers..."
+podman stop container-a container-b container-c 2>/dev/null || true
+podman rm container-a container-b container-c 2>/dev/null || true
+
+# Build container images
+echo "Building container images..."
+podman build -t container-a:latest \$APPUSER_HOME/containers/container-a/
+podman build -t container-b:latest \$APPUSER_HOME/containers/container-b/
+podman build -t container-c:latest \$APPUSER_HOME/containers/container-c/
+
+# Launch Container A (S3) with static keys
+echo "Launching Container A (S3 workload)..."
+podman run -d \\
+  -e AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY \\
+  -e AWS_SECRET_ACCESS_KEY=$S3_SECRET_KEY \\
+  -e AWS_DEFAULT_REGION=$REGION \\
+  -e S3_BUCKET=$S3_BUCKET \\
+  --name container-a \\
+  container-a:latest
+
+# Launch Container B (DynamoDB) with static keys
+echo "Launching Container B (DynamoDB workload)..."
+podman run -d \\
+  -e AWS_ACCESS_KEY_ID=$DDB_ACCESS_KEY \\
+  -e AWS_SECRET_ACCESS_KEY=$DDB_SECRET_KEY \\
+  -e AWS_DEFAULT_REGION=$REGION \\
+  -e DYNAMODB_TABLE=$DYNAMODB_TABLE \\
+  --name container-b \\
+  container-b:latest
+
+# Launch Container C (KMS) with static keys
+echo "Launching Container C (KMS workload)..."
+podman run -d \\
+  -e AWS_ACCESS_KEY_ID=$KMS_ACCESS_KEY \\
+  -e AWS_SECRET_ACCESS_KEY=$KMS_SECRET_KEY \\
+  -e AWS_DEFAULT_REGION=$REGION \\
+  -e KMS_KEY_ID=$KMS_KEY_ID \\
+  --name container-c \\
+  container-c:latest
+
+echo ""
+echo "=== Container Status ==="
+podman ps -a
+
+echo ""
+echo "=== Waiting 35 seconds for first operations... ==="
+sleep 35
+
+echo ""
+echo "=== Container A Logs ==="
+podman logs container-a
+
+echo ""
+echo "=== Container B Logs ==="
+podman logs container-b
+
+echo ""
+echo "=== Container C Logs ==="
+podman logs container-c
+DEPLOYEOF
+
+chmod +x $APPUSER_HOME/scripts/deploy-legacy.sh
+
+# --- Phase 2: Role-based deploy script (pre-staged for migration) ---
+cat > $APPUSER_HOME/scripts/deploy-roles.sh << 'DEPLOYEOF'
+#!/bin/bash
+set -euo pipefail
+echo "=== Role-Based Deployment (IMDS + AWS Config Profiles) ==="
+
+APPUSER_HOME=/home/appuser
+source $APPUSER_HOME/.env
+
+# Stop and remove existing containers
+echo "Stopping existing containers..."
+podman stop container-a container-b container-c 2>/dev/null || true
+podman rm container-a container-b container-c 2>/dev/null || true
+
+# Verify pasta networking
+echo "Verifying network backend..."
+podman info | grep -i network || true
+
+# Verify IMDS reachability
+echo "Verifying IMDS reachability..."
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || echo "IMDS_FAILED")
+if [ "$TOKEN" != "IMDS_FAILED" ]; then
+  echo "IMDS reachable - token obtained"
+else
+  echo "WARNING: IMDS not reachable"
+fi
+
+# Build container images
+echo "Building container images..."
+podman build -t container-a:latest $APPUSER_HOME/containers/container-a/
+podman build -t container-b:latest $APPUSER_HOME/containers/container-b/
+podman build -t container-c:latest $APPUSER_HOME/containers/container-c/
+
+# Launch Container A (S3 with role assumption)
+echo "Launching Container A (S3 workload with role assumption)..."
+podman run -d \
+  --network pasta \
+  -v "$APPUSER_HOME/aws-configs/container-a-config:/home/app/.aws/config:ro,z" \
+  -e AWS_PROFILE=container-role \
+  -e AWS_DEFAULT_REGION=$REGION \
+  -e S3_BUCKET=$S3_BUCKET \
+  --name container-a \
+  container-a:latest
+
+# Launch Container B (DynamoDB with role assumption)
+echo "Launching Container B (DynamoDB workload with role assumption)..."
+podman run -d \
+  --network pasta \
+  -v "$APPUSER_HOME/aws-configs/container-b-config:/home/app/.aws/config:ro,z" \
+  -e AWS_PROFILE=container-role \
+  -e AWS_DEFAULT_REGION=$REGION \
+  -e DYNAMODB_TABLE=$DYNAMODB_TABLE \
+  --name container-b \
+  container-b:latest
+
+# Launch Container C (KMS with role assumption)
+echo "Launching Container C (KMS workload with role assumption)..."
+podman run -d \
+  --network pasta \
+  -v "$APPUSER_HOME/aws-configs/container-c-config:/home/app/.aws/config:ro,z" \
+  -e AWS_PROFILE=container-role \
+  -e AWS_DEFAULT_REGION=$REGION \
+  -e KMS_KEY_ID=$KMS_KEY_ID \
+  --name container-c \
+  container-c:latest
+
+echo ""
+echo "=== Container Status ==="
+podman ps -a
+
+echo ""
+echo "=== Waiting 35 seconds for first operations... ==="
+sleep 35
+
+echo ""
+echo "=== Container A Logs ==="
+podman logs container-a
+
+echo ""
+echo "=== Container B Logs ==="
+podman logs container-b
+
+echo ""
+echo "=== Container C Logs ==="
+podman logs container-c
+DEPLOYEOF
+
+chmod +x $APPUSER_HOME/scripts/deploy-roles.sh
+
+# --- Pre-stage Phase 2 AWS config files (not used until migration) ---
+mkdir -p $APPUSER_HOME/aws-configs
+
+cat > $APPUSER_HOME/aws-configs/container-a-config << EOF
+[profile container-role]
+role_arn = $CONTAINER_A_ROLE_ARN
+credential_source = Ec2InstanceMetadata
+region = $REGION
+EOF
+
+cat > $APPUSER_HOME/aws-configs/container-b-config << EOF
+[profile container-role]
+role_arn = $CONTAINER_B_ROLE_ARN
+credential_source = Ec2InstanceMetadata
+region = $REGION
+EOF
+
+cat > $APPUSER_HOME/aws-configs/container-c-config << EOF
+[profile container-role]
+role_arn = $CONTAINER_C_ROLE_ARN
+credential_source = Ec2InstanceMetadata
+region = $REGION
+EOF
+
+# --- Write resource info to env file for deploy-roles.sh ---
+cat > $APPUSER_HOME/.env << EOF
+S3_BUCKET=$S3_BUCKET
+DYNAMODB_TABLE=$DYNAMODB_TABLE
+KMS_KEY_ID=$KMS_KEY_ID
+REGION=$REGION
+EOF
+
+# Fix ownership
+chown -R appuser:appuser $APPUSER_HOME/containers $APPUSER_HOME/scripts $APPUSER_HOME/aws-configs $APPUSER_HOME/.env
+
+# ============================================================
+# PHASE 1: Run legacy deployment with static access keys
+# ============================================================
+echo "=== Running Phase 1 (legacy) deployment as appuser ==="
+su - appuser -c "$APPUSER_HOME/scripts/deploy-legacy.sh"
+
+echo "=== User data script completed at $(date) ==="
